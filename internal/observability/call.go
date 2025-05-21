@@ -167,53 +167,31 @@ func (c call) endLogs(
 		}
 
 		var lvl zapcore.Level
-		// use applicationError and failure logging levels
-		// this is deprecated and will only be used by yarpc service
-		// which have added configuration for loggers.
 		if c.levels.useApplicationErrorFailureLevels {
 			lvl = c.levels.failure
-
-			// For logging purposes, application errors are
-			//  - Thrift exceptions (appErrBitWithNoError == true)
-			//  - `yarpcerror`s with error details (ie created with `encoding/protobuf.NewError`)
-			//
-			// This will be the least surprising behavior for users migrating from
-			// Thrift exceptions to Protobuf error details.
-			//
-			// Unfortunately, all errors returned from a Protobuf handler are marked as
-			// an application error on the 'transport.ResponseWriter'. Therefore, we
-			// distinguish an application error from a regular error by inspecting if an
-			// error detail was set.
-			//
-			// https://github.com/yarpc/yarpc-go/pull/1912
 			hasErrDetails := len(yarpcerrors.FromError(err).Details()) > 0
 			if appErrBitWithNoError || (isApplicationError && hasErrDetails) {
 				lvl = c.levels.applicationError
 			}
 		} else {
-			var code *yarpcerrors.Code
+			var code yarpcerrors.Code
 			lvl = c.levels.serverError
-
-			if appErrBitWithNoError { // thrift exception
-				if applicationErrorMeta != nil && applicationErrorMeta.Code != nil { // thrift exception with rpc.code
-					code = applicationErrorMeta.Code
+			if appErrBitWithNoError {
+				if applicationErrorMeta != nil && applicationErrorMeta.Code != nil {
+					code = *applicationErrorMeta.Code
 				} else {
-					lvl = c.levels.clientError
+					code = yarpcerrors.CodeInvalidArgument
 				}
+			} else if err != nil {
+				code = yarpcerrors.FromError(err).Code()
 			}
-
-			if err != nil { // tchannel/HTTP/gRPC errors
-				c := yarpcerrors.FromError(err).Code()
-				code = &c
-			}
-
-			if code != nil {
-				if fault := yarpcerrors.GetFaultTypeFromCode(*code); fault == yarpcerrors.ClientFault {
-					lvl = c.levels.clientError
-				}
+			switch code {
+			case yarpcerrors.CodeInvalidArgument, yarpcerrors.CodeNotFound, yarpcerrors.CodeAlreadyExists, yarpcerrors.CodePermissionDenied, yarpcerrors.CodeFailedPrecondition, yarpcerrors.CodeAborted, yarpcerrors.CodeOutOfRange, yarpcerrors.CodeUnimplemented, yarpcerrors.CodeUnavailable, yarpcerrors.CodeDataLoss, yarpcerrors.CodeUnauthenticated, yarpcerrors.CodeResourceExhausted, yarpcerrors.CodeDeadlineExceeded:
+				lvl = c.levels.clientError
+			case yarpcerrors.CodeInternal, yarpcerrors.CodeUnknown:
+				lvl = c.levels.serverError
 			}
 		}
-
 		ce = c.edge.logger.Check(lvl, msg)
 	}
 
@@ -221,46 +199,39 @@ func (c call) endLogs(
 		return
 	}
 
-	fields := make([]zapcore.Field, 0, 9+len(extraLogFields))
-	fields = append(fields, zap.String("rpcType", c.rpcType.String()))
-	fields = append(fields, zap.Duration("latency", elapsed))
-	fields = append(fields, zap.Bool("successful", err == nil && !isApplicationError))
-	fields = append(fields, c.extract(c.ctx))
-	if deadlineTime, ok := c.ctx.Deadline(); ok {
-		fields = append(fields, zap.Duration("timeout", deadlineTime.Sub(c.started)))
+	fields := []zap.Field{
+		zap.String("service", c.req.Service),
+		zap.String("procedure", c.req.Procedure),
+		zap.String("caller", c.req.Caller),
+		zap.Duration("elapsed", elapsed),
+		zap.Int("requestSize", c.req.BodySize),
 	}
 
-	if appErrBitWithNoError { // Thrift exception
-		fields = append(fields, zap.String(_error, "application_error"))
+	if c.extract != nil {
+		fields = append(fields, c.extract(c.ctx))
+	}
+
+	if err != nil {
+		yErr := yarpcerrors.FromError(err)
+		fields = append(fields,
+			zap.String(_errorNameLogKey, errToMetricString(err)),
+			zap.String(_errorCodeLogKey, yErr.Code().String()),
+		)
+		if details := yErr.Details(); len(details) > 0 {
+			fields = append(fields, zap.String(_errorDetailsLogKey, string(details)))
+		}
+	}
+
+	if isApplicationError {
+		fields = append(fields, zap.Bool("applicationError", true))
 		if applicationErrorMeta != nil {
+			if applicationErrorMeta.Name != "" {
+				fields = append(fields, zap.String("applicationErrorName", applicationErrorMeta.Name))
+			}
 			if applicationErrorMeta.Code != nil {
-				fields = append(fields, zap.String(_errorCodeLogKey, applicationErrorMeta.Code.String()))
-			}
-			if applicationErrorMeta.Name != "" {
-				fields = append(fields, zap.String(_errorNameLogKey, applicationErrorMeta.Name))
-			}
-			if applicationErrorMeta.Details != "" {
-				fields = append(fields, zap.String(_errorDetailsLogKey, applicationErrorMeta.Details))
+				fields = append(fields, zap.String("applicationErrorCode", applicationErrorMeta.Code.String()))
 			}
 		}
-
-	} else if isApplicationError { // Protobuf error
-		fields = append(fields, zap.Error(err))
-		fields = append(fields, zap.String(_errorCodeLogKey, yarpcerrors.FromError(err).Code().String()))
-		if applicationErrorMeta != nil {
-			// ignore transport.ApplicationErrorMeta#Code, since we should get this
-			// directly from the error
-			if applicationErrorMeta.Name != "" {
-				fields = append(fields, zap.String(_errorNameLogKey, applicationErrorMeta.Name))
-			}
-			if applicationErrorMeta.Details != "" {
-				fields = append(fields, zap.String(_errorDetailsLogKey, applicationErrorMeta.Details))
-			}
-		}
-
-	} else if err != nil { // unknown error
-		fields = append(fields, zap.Error(err))
-		fields = append(fields, zap.String(_errorCodeLogKey, yarpcerrors.FromError(err).Code().String()))
 	}
 
 	fields = append(fields, extraLogFields...)

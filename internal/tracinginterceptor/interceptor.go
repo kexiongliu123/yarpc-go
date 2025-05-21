@@ -22,6 +22,7 @@ package tracinginterceptor
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/opentracing/opentracing-go"
@@ -200,23 +201,17 @@ func (i *Interceptor) HandleStream(s *transport.ServerStream, h transport.Stream
 		}
 	}()
 
-	tracedRaw := &tracedServerStream{
-		serverStream: s,
-		span:         span,
-	}
-	wrapped, err := transport.NewServerStream(tracedRaw)
-	if err != nil {
+	// Add nil message handling
+	if req == nil || req.Meta == nil {
 		if span != nil {
-			span.LogFields(logFieldEventError, log.String("message", "Failed to wrap traced server stream"))
-			span.Finish()
+			span.LogFields(log.Error(fmt.Errorf("received nil message from stream")))
+			span.SetTag("error", true)
 		}
-		return err
+		return yarpcerrors.Newf(yarpcerrors.CodeInvalidArgument, "received nil message from stream")
 	}
-	err = h.HandleStream(wrapped)
-	if span != nil {
-		return updateSpanWithErrorDetails(span, err != nil, nil, err)
-	}
-	return err
+
+	err := h.HandleStream(s)
+	return updateSpanWithErrorDetails(span, false, nil, err)
 }
 
 // CallStream implements interceptor.StreamOutbound
